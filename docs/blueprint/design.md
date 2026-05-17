@@ -1,188 +1,156 @@
-# UniHub Workshop - Technical Design
+# UniHub Workshop — Technical Design
 
-## Kiến trúc tổng thể
+## 1. Kiến trúc tổng thể
 
-UniHub Workshop sử dụng kiến trúc **Modular Monolith + Background Workers**. Backend là một ứng dụng duy nhất, nhưng được chia thành các module nghiệp vụ độc lập: Auth/RBAC, Workshop, Registration, Payment, Notification, Check-in, Student Import, AI Summary và Realtime.
+UniHub Workshop sử dụng kiến trúc **Modular Monolith + Background Workers**. Toàn bộ backend được đóng gói trong một ứng dụng NestJS duy nhất, nhưng được phân tách rõ ràng theo ranh giới nghiệp vụ (Domain-Driven boundaries): `Auth/RBAC`, `Workshop`, `Registration`, `Payment`, `Notification`, `Check-in`, `Student Import`, `AI Summary` và `Realtime/Load Protection`.
 
-Các request cần phản hồi ngay được xử lý bởi Backend API. Các tác vụ tốn thời gian, dễ lỗi hoặc cần retry được đưa vào queue cho background workers xử lý, ví dụ gửi email, expire hold slot, payment reconcile, import CSV và tạo AI summary.
+### Thành phần & Giao tiếp
+| Thành phần | Vai trò | Cơ chế giao tiếp |
+|---|---|---|
+| **Backend API** | Xử lý request đồng bộ, thực thi nghiệp vụ, RBAC, rate limit | REST + SSE (Server-Sent Events) |
+| **Background Workers** | Xử lý tác vụ nặng/bất đồng bộ (email, AI, CSV, reconcile, expire hold) | BullMQ queues trên Redis |
+| **PostgreSQL (Supabase)** | Source of truth cho dữ liệu nghiệp vụ, đảm bảo ACID | SQL transaction, row-level locking |
+| **Redis (Docker)** | Cache, Virtual Queue, Token Bucket, Circuit Breaker state, Pub/Sub, JWT blocklist | `ioredis`, Lua scripts (atomic), TTL keys |
+| **Object Storage** | Lưu PDF workshop, CSV legacy, QR image | HTTP REST API (Supabase Storage) |
+| **Client Apps** | Student Web, Admin Web, Check-in PWA | HTTPS, IndexedDB (PWA offline), Service Worker |
 
-Lý do lựa chọn:
+### Tại sao chọn Modular Monolith?
+- **Phù hợp quy mô nhóm & đồ án:** Giảm đáng kể độ phức tạp vận hành so với microservices (không cần service discovery, distributed tracing phức tạp, hay network latency management).
+- **Biên giới nghiệp vụ rõ ràng:** Mỗi module tự quản lý repository và service, không gọi chéo trực tiếp DB của module khác. Giao tiếp liên module thông qua **Domain Events** và **Message Broker**.
+- **Khả năng mở rộng tương lai:** Khi tải trọng tăng thực tế, các module nặng (Payment, Notification, AI) có thể tách ra thành microservices độc lập mà không cần viết lại nghiệp vụ.
 
-- Đơn giản hơn microservices trong phát triển và vận hành.
-- Vẫn có boundary rõ ràng giữa các nghiệp vụ.
-- Phù hợp nhóm nhỏ và bối cảnh đồ án/hệ thống trường đại học.
-- Có thể mở rộng sau này bằng cách tách các module nặng như Payment, Notification hoặc AI thành service riêng.
+### Mô hình chịu lỗi (Fault Isolation & Graceful Degradation)
+Hệ thống được thiết kế theo nguyên tắc *"Fail safely, degrade gracefully"*. Khi một thành phần gặp sự cố, phần còn lại vẫn hoạt động:
+| Thành phần lỗi | Hành vi hệ thống | Cơ chế bảo vệ |
+|---|---|---|
+| **Payment Gateway down** | Xem lịch & đăng ký miễn phí vẫn chạy. Đăng ký có phí trả `503`. | Circuit Breaker + Async Webhook |
+| **Email Provider lỗi** | Registration vẫn `CONFIRMED`. Email retry độc lập theo channel. | Outbox Pattern + Channel Adapter |
+| **AI Provider timeout** | Upload PDF thành công. Summary chuyển `SUMMARY_FAILED`, workshop vẫn hiển thị. | Async Worker + Retry Backoff + Status Flag |
+| **Redis Pub/Sub lỗi** | Realtime số chỗ ngừng cập nhật UI. Đăng ký vẫn hoạt động bình thường. | DB Transaction là source of truth |
+| **Mạng check-in mất** | Staff vẫn quét QR, lưu event local. Sync lại khi có mạng. | PWA Offline-first + IndexedDB + Idempotent Sync |
+| **CSV lỗi/cú pháp sai** | Batch bị `REJECTED`. Bảng `students` không bị ảnh hưởng. | Staging Table + Atomic Promotion |
 
-Khi một phần gặp sự cố:
+---
 
-- Payment lỗi không làm hỏng xem lịch hoặc workshop miễn phí nhờ circuit breaker và graceful degradation.
-- Email lỗi không làm rollback registration vì notification chạy async.
-- AI lỗi chỉ làm summary chuyển `SUMMARY_FAILED`, workshop vẫn hoạt động.
-- CSV lỗi bị reject ở staging, không ảnh hưởng bảng `students`.
-- Mất mạng tại điểm check-in không làm mất dữ liệu vì PWA lưu event trong IndexedDB.
+## 2. C4 Diagram
 
-## C4 Diagram
-
-### Level 1 - System Context
-
+### Level 1 — System Context
+Mô tả UniHub Workshop trong bức tranh tổng thể: người dùng trực tiếp và các hệ thống bên ngoài tích hợp.
 ```mermaid
 flowchart LR
-    Student["Sinh viên"]
-    Organizer["Ban tổ chức"]
-    Staff["Nhân sự check-in"]
-    Admin["Quản trị hệ thống"]
-    UniHub["UniHub Workshop System"]
-    Legacy["Hệ thống quản lý sinh viên cũ\nCSV export ban đêm"]
-    Payment["Cổng thanh toán"]
-    Email["Email Provider"]
-    AI["AI Model Provider"]
+    Student["👤 Sinh viên"]
+    Organizer["👔 Ban tổ chức"]
+    Staff["📱 Nhân sự Check-in"]
+    Admin["🛡️ Quản trị hệ thống"]
+    UniHub["🌐 UniHub Workshop System"]
+    Legacy["📁 Hệ thống cũ<br/>CSV Export ban đêm"]
+    Payment["💳 Cổng thanh toán"]
+    Email["📧 Email Provider"]
+    AI["🤖 AI Model Provider"]
 
-    Student -->|"Xem lịch, đăng ký, thanh toán, nhận QR"| UniHub
-    Organizer -->|"Quản lý workshop, upload PDF, xem thống kê"| UniHub
-    Staff -->|"Preload roster, quét QR, sync check-in"| UniHub
-    Admin -->|"Quản lý người dùng, vai trò, cấu hình"| UniHub
-
+    Student -->|"Xem lịch, đăng ký,<br/>thanh toán, nhận QR"| UniHub
+    Organizer -->|"Quản lý workshop,<br/>upload PDF, xem thống kê"| UniHub
+    Staff -->|"Preload roster,<br/>quét QR, sync check-in"| UniHub
+    Admin -->|"Quản lý user, role,<br/>cấu hình hệ thống"| UniHub
+    
     UniHub -->|"Đọc CSV theo lịch"| Legacy
-    UniHub -->|"Tạo payment intent, nhận webhook"| Payment
-    UniHub -->|"Gửi email xác nhận/thông báo"| Email
-    UniHub -->|"Gửi nội dung PDF đã xử lý để tóm tắt"| AI
+    UniHub -->|"Tạo payment intent,<br/>nhận signed webhook"| Payment
+    UniHub -->|"Gửi email/xác nhận<br/>theo template"| Email
+    UniHub -->|"Gửi chunk PDF<br/>để tóm tắt"| AI
 ```
 
-### Level 2 - Container
-
+### Level 2 — Container
+Phân rã hệ thống thành các container công nghệ, thể hiện cách chúng giao tiếp và phụ thuộc lẫn nhau.
 ```mermaid
 flowchart TB
-    subgraph Clients["Client Containers"]
-        StudentWeb["Student Web App\nReact + Vite"]
-        AdminWeb["Admin Web App\nReact + Vite"]
-        CheckinPWA["Check-in PWA\nService Worker + IndexedDB + QR Scanner"]
+    subgraph Clients["🖥️ Client Containers"]
+        SW["Student Web App<br/>React + Vite"]
+        AW["Admin Web App<br/>React + Vite"]
+        CP["Check-in PWA<br/>Service Worker + IndexedDB"]
     end
 
-    subgraph UniHub["UniHub Workshop"]
-        API["Backend API\nNestJS\nModular Monolith"]
-        Worker["Background Workers\nQueue Consumers"]
-        DB[("PostgreSQL\nTransactional Data")]
-        Redis[("Redis\nVirtual Queue, Rate Limit, Pub/Sub")]
-        Broker["Message Broker\nBullMQ"]
-        Storage[("Supabase Storage\nPDF, CSV")]
+    subgraph UniHub["🏗️ UniHub Backend"]
+        API["Backend API<br/>NestJS Modular Monolith"]
+        WK["Background Workers<br/>BullMQ Consumers"]
+        DB[("🗄️ PostgreSQL<br/>Transactional DB")]
+        RD[("⚡ Redis<br/>Cache/Queue/PubSub")]
+        BR["📦 Message Broker<br/>BullMQ"]
+        ST["☁️ Supabase Storage<br/>PDF, CSV, QR"]
     end
 
-    subgraph External["External Systems"]
-        Legacy["Legacy Student System\nCSV Export"]
-        Payment["Payment Gateway"]
-        Email["Email Provider"]
-        AI["AI Model Provider"]
+    subgraph External["🌍 External Systems"]
+        LG["Legacy Student System"]
+        PG["Payment Gateway"]
+        EM["Email Provider"]
+        AM["AI Model Provider"]
     end
 
-    StudentWeb <-->|"HTTPS REST\nSSE/WebSocket"| API
-    AdminWeb <-->|"HTTPS REST"| API
-    CheckinPWA <-->|"HTTPS REST sync\nOffline local storage"| API
-
-    API <-->|"SQL transaction"| DB
-    API <-->|"Queue token, rate limit, pub/sub"| Redis
-    API -->|"Publish jobs/events"| Broker
-    API <-->|"Upload/read file metadata"| Storage
-
-    Worker -->|"Consume jobs"| Broker
-    Worker <-->|"Read/write"| DB
-    Worker <-->|"Read/write files"| Storage
-    Worker <-->|"Cache/pub-sub"| Redis
-
-    Legacy -->|"Nightly CSV file"| Storage
-    API -->|"Create payment intent"| Payment
-    Payment -->|"Signed webhook"| API
-    Worker -->|"Send email"| Email
-    Worker -->|"Generate summary"| AI
+    SW <-->|"REST + SSE"| API
+    AW <-->|"REST"| API
+    CP <-->|"REST sync Offline Local Cache"| API
+    API <-->|"ACID Transaction Row Lock"| DB
+    API <-->|"Token Bucket, Virtual Queue, PubSub"| RD
+    API -->|"Publish Jobs/Events"| BR
+    API <-->|"Upload/Metadata"| ST
+    WK -->|"Consume Jobs"| BR
+    WK <-->|"Read/Write"| DB
+    WK <-->|"File Process"| ST
+    WK <-->|"State/Cache"| RD
+    LG -->|"Nightly CSV"| ST
+    API -->|"Create Intent"| PG
+    PG -->|"Signed Webhook"| API
+    WK -->|"Send Email"| EM
+    WK -->|"Summarize"| AM
 ```
 
-## High-Level Architecture Diagram
+---
 
+## 3. High-Level Architecture Diagram
+Sơ đồ luồng dữ liệu chi tiết tại các điểm tích hợp trọng yếu, đặc biệt nhấn mạnh luồng **Check-in Offline** và **Payment Resilience**.
 ```mermaid
 flowchart LR
-    Student["Sinh viên"] --> StudentWeb["Student Web"]
-    Organizer["Ban tổ chức"] --> AdminWeb["Admin Web"]
-    Staff["Check-in Staff"] --> PWA["Check-in PWA"]
-
-    StudentWeb -->|"Browse/register\nSSE seat updates"| API["Backend API"]
-    AdminWeb -->|"Workshop/admin operations"| API
-    PWA -->|"Online preload/sync"| API
-    PWA -.->|"Offline scan"| IndexedDB[("IndexedDB\nRoster + Event Log")]
-    IndexedDB -.->|"Sync idempotent events"| API
-
-    API -->|"Row lock + hold slot"| PG[("PostgreSQL")]
-    API -->|"Virtual queue\nrate limit\npub/sub"| Redis[("Redis")]
-    API -->|"Jobs/events"| Queue["Message Broker"]
-    Queue --> Workers["Background Workers"]
-    Workers --> PG
-    Workers --> Storage[("Object Storage")]
-
-    Legacy["Legacy Student System"] -->|"CSV export"| Storage
-    Workers -->|"Parse + validate + promote"| PG
-
-    API -->|"Payment intent"| Payment["Payment Gateway"]
-    Payment -->|"Webhook"| API
-    Workers -->|"Reconcile/timeout"| Payment
-
-    Workers -->|"Extract + summarize"| AI["AI Model Provider"]
-    Workers -->|"Send email"| Email["Email Provider"]
-    API -->|"Push seat update"| StudentWeb
+    %% Actors & Clients
+    S[👤 Sinh viên] --> SW[Student Web]
+    O[👔 Organizer] --> AW[Admin Web]
+    SF[📱 Staff] --> PWA[Check-in PWA]
+    
+    %% Core Backend
+    SW -->|"Browse/Register<br/>SSE Seats"| API[Backend API]
+    AW -->|"Workshop Ops"| API
+    PWA -->|"Online Preload/Sync"| API
+    PWA -.->|"Offline Scan & Cache"| IDB[("IndexedDB<br/>Roster + Event Log")]
+    IDB -.->|"Idempotent Sync"| API
+    
+    %% Data & State
+    API -->|"Row Lock + Hold Slot"| PGDB[("PostgreSQL")]
+    API -->|"VQueue, Rate Limit,<br/>CB State, Pub/Sub"| REDIS[("Redis")]
+    API -->|"Publish Jobs"| Q[Message Broker]
+    Q --> WK[Workers]
+    WK --> PGDB
+    WK --> ST[("Object Storage")]
+    
+    %% External Integrations
+    API -->|"Payment Intent"| GATEWAY[Payment Gateway]
+    GATEWAY -->|"Signed Webhook"| API
+    WK -->|"Reconcile/Timeout"| GATEWAY
+    WK -->|"Extract + AI Call"| AI[AI Provider]
+    WK -->|"Send Email"| EMAIL[Email Provider]
+    LEGACY[Legacy System] -->|"CSV Export"| ST
+    
+    %% API Push
+    API -->|"Push Seat Update"| SW
 ```
 
-## Các luồng nghiệp vụ quan trọng
+---
 
-Chi tiết từng luồng xem tại các file spec riêng.
+## 4. Thiết kế cơ sở dữ liệu
 
-### Luồng đăng ký workshop có phí
+### Lựa chọn Database
+Hệ thống sử dụng **PostgreSQL** làm cơ sở dữ liệu chính, kết hợp **Redis** cho dữ liệu tạm thời/trạng thái.
+- **Tại sao không chọn NoSQL?** Các nghiệp vụ cốt lõi (Registration, Payment, Check-in) đòi hỏi tính nhất quán tuyệt đối (ACID), ràng buộc khóa ngoại, và row-level locking để chống oversell. NoSQL (MongoDB/DynamoDB) không đảm bảo được `confirmed_count + held_count ≤ capacity` ở cấp độ transaction một cách an toàn và dễ dàng như PostgreSQL.
+- **Vai trò của Redis:** Chỉ dùng cho dữ liệu có TTL hoặc trạng thái biến động nhanh: Virtual Queue tokens, Token Bucket counters, Circuit Breaker state, SSE Pub/Sub channels, và JWT revocation list.
 
-> Chi tiết: [`specs/registration.md`](specs/registration.md) → [`specs/payment.md`](specs/payment.md)
-
-1. Sinh viên bấm "Đăng ký" trên Student Web App — frontend gửi kèm queue token và `Idempotency-Key`.
-2. Backend kiểm tra auth, role `STUDENT`, rate limit và queue token.
-3. Mở DB transaction, khóa dòng workshop bằng row lock.
-4. Kiểm tra workshop còn chỗ và đang mở đăng ký — tạo registration `PENDING_PAYMENT`, đặt `hold_expires_at`, tăng `held_count`.
-5. Transaction commit. API trả payment URL cho frontend.
-6. Payment Adapter gọi gateway tạo payment intent (kèm idempotency key).
-7. Sinh viên thanh toán trên trang gateway.
-8. Gateway gửi signed webhook — backend xác thực chữ ký, chuyển payment `SUCCEEDED`.
-9. Registration chuyển `CONFIRMED`, giảm `held_count`, tăng `confirmed_count`, sinh QR token.
-10. Notification worker gửi xác nhận qua in-app và email.
-
-**Xử lý lỗi giữa chừng:** Nếu client timeout sau khi thanh toán — webhook vẫn đến và xử lý đúng, sinh viên không cần thanh toán lại. Nếu hold hết hạn trước khi webhook đến — chuyển `NEEDS_REVIEW` và xử lý theo chính sách hoàn tiền.
-
-### Luồng check-in khi mất mạng và đồng bộ lại
-
-> Chi tiết: [`specs/checkin.md`](specs/checkin.md)
-
-**Chuẩn bị (có mạng):** Staff đăng nhập bằng tài khoản `CHECKIN_STAFF`, PWA preload roster các registration hợp lệ và public key vào IndexedDB.
-
-**Scan offline:** PWA decode QR, kiểm tra chữ ký và tra IndexedDB local. Nếu hợp lệ, ghi `checkin_event_id` (UUID) vào IndexedDB với trạng thái `PENDING_SYNC`.
-
-**Đồng bộ (có mạng lại):** PWA gửi batch event lên API. Backend upsert theo `event_id` (idempotent) — gửi lại nhiều lần không tạo check-in trùng.
-
-**Xử lý lỗi giữa chừng:** PWA bị đóng khi offline — event vẫn nằm trong IndexedDB, đồng bộ lại sau khi mở lại. Hai thiết bị scan cùng QR offline — server accepted event đầu tiên, event sau bị đánh dấu duplicate.
-
-### Luồng nhập dữ liệu từ CSV đêm
-
-> Chi tiết: [`specs/student-import.md`](specs/student-import.md)
-
-1. Hệ thống cũ export CSV vào object storage theo lịch đêm.
-2. Scheduler phát hiện file mới qua checksum — tạo `student_import_batch` trạng thái `PARSING`.
-3. Worker parse từng dòng vào staging table `student_import_rows`, validate header + required fields + trùng.
-4. Nếu tỷ lệ lỗi dưới ngưỡng, mở transaction upsert vào `students` — promotion atomic.
-5. Batch chuyển `PROMOTED`, admin xem báo cáo.
-
-**Xử lý lỗi giữa chừng:** File thiếu cột — batch `REJECTED`, bảng `students` không đổi. Worker chết khi promote — transaction rollback, retry an toàn. Hệ thống vẫn cho đăng ký trong lúc import chạy.
-
-## Thiết kế cơ sở dữ liệu
-
-### Lựa chọn database
-
-Database chính là **PostgreSQL** vì hệ thống cần transaction mạnh, unique constraint, quan hệ dữ liệu rõ ràng và row-level locking để chống oversell. Redis được dùng cho dữ liệu tạm như virtual queue, rate limit, pub/sub realtime. Object storage lưu PDF và CSV.
-
-Không chọn NoSQL làm database chính vì registration, payment và check-in cần tính nhất quán, audit và ràng buộc quan hệ tốt.
-
-### Entity chính
-
+### Entity Relationship Diagram (Schema chính)
 ```mermaid
 erDiagram
     users ||--o{ user_roles : has
@@ -198,305 +166,135 @@ erDiagram
     users ||--o{ notification_events : receives
     notification_events ||--o{ notification_deliveries : produces
 
-    users {
-        uuid id PK
-        string email UK
-        string password_hash
-        string full_name
-        string status
-        datetime created_at
-    }
-
-    roles {
-        uuid id PK
-        string code UK
-        string name
-    }
-
-    students {
-        uuid id PK
-        uuid user_id FK
-        string student_code UK
-        string email
-        string full_name
-        string faculty
-        string status
-        uuid source_batch_id FK
-        datetime last_seen_in_import_at
-    }
-
-    workshops {
-        uuid id PK
-        string title
-        string speaker_name
-        string room_name
-        string room_map_url
-        int capacity
-        int confirmed_count
-        int held_count
-        string fee_type
-        decimal price
-        datetime starts_at
-        datetime ends_at
-        string status
-        string summary_status
-        text ai_summary
-    }
-
-    registrations {
-        uuid id PK
-        uuid workshop_id FK
-        uuid student_id FK
-        string status
-        datetime hold_expires_at
-        string qr_token_hash
-        string idempotency_key
-        datetime created_at
-    }
-
-    payments {
-        uuid id PK
-        uuid registration_id FK
-        string gateway
-        string payment_intent_id UK
-        string idempotency_key UK
-        decimal amount
-        string status
-        jsonb gateway_payload
-    }
-
-    checkin_events {
-        uuid id PK
-        string event_id UK
-        uuid registration_id FK
-        uuid workshop_id FK
-        uuid staff_user_id FK
-        string device_id
-        datetime scanned_at
-        datetime synced_at
-        string status
-    }
-
-    workshop_documents {
-        uuid id PK
-        uuid workshop_id FK
-        uuid uploaded_by FK
-        string original_filename
-        string file_path
-        int file_size_bytes
-        string mime_type
-        string upload_status
-        datetime created_at
-    }
-
-    student_import_batches {
-        uuid id PK
-        string file_path
-        string checksum UK
-        string status
-        int total_rows
-        int valid_rows
-        int error_rows
-        int error_threshold_pct
-        datetime started_at
-        datetime completed_at
-        datetime created_at
-    }
-
-    student_import_rows {
-        uuid id PK
-        uuid batch_id FK
-        uuid student_id FK
-        int row_number
-        string student_code
-        string email
-        string full_name
-        string faculty
-        string row_status
-        string error_message
-    }
-
-    notification_events {
-        uuid id PK
-        string event_type
-        uuid recipient_user_id FK
-        jsonb payload
-        string status
-        datetime created_at
-    }
-
-    notification_deliveries {
-        uuid id PK
-        uuid event_id FK
-        string channel
-        string status
-        string error_reason
-        int attempt_count
-        datetime sent_at
-        datetime created_at
-    }
+    users { uuid id PK string email UK string password_hash string status }
+    roles { uuid id PK string code UK string name }
+    students { uuid id PK uuid user_id FK string student_code UK string email string faculty uuid source_batch_id FK datetime last_seen_in_import_at }
+    workshops { uuid id PK string title int capacity int confirmed_count int held_count string status string summary_status text ai_summary datetime starts_at datetime ends_at }
+    registrations { uuid id PK uuid workshop_id FK uuid student_id FK string status datetime hold_expires_at string idempotency_key }
+    payments { uuid id PK uuid registration_id FK string payment_intent_id UK string idempotency_key UK decimal amount string status }
+    checkin_events { uuid id PK string event_id UK uuid registration_id FK datetime scanned_at string status }
+    student_import_batches { uuid id PK string checksum UK string status int total_rows int error_rows }
+    student_import_rows { uuid id PK uuid batch_id FK int row_number string row_status string error_message }
+    notification_events { uuid id PK string event_type uuid recipient_user_id FK jsonb payload }
+    notification_deliveries { uuid id PK uuid event_id FK string channel string status int attempt_count }
 ```
 
-### Ràng buộc schema quan trọng
+### Ràng buộc Schema quan trọng (Data Integrity)
+| Ràng buộc | Mục đích | Cơ chế thực thi |
+|---|---|---|
+| `confirmed_count + held_count ≤ capacity` | Chống oversell tuyệt đối | Kiểm tra trong transaction + `SELECT FOR UPDATE` |
+| Unique active registration per `(student_id, workshop_id)` | Một sinh viên không đăng ký trùng workshop | Partial unique index: `WHERE status IN ('CONFIRMED','PENDING_PAYMENT')` |
+| `payments.payment_intent_id` UNIQUE | Chống tạo nhiều intent cho 1 registration | Database constraint |
+| `payments.idempotency_key` UNIQUE | Chống double charge khi retry | Database constraint |
+| `checkin_events.event_id` UNIQUE | Sync offline idempotent, tránh trùng check-in | Database constraint |
+| `student_import_batches.checksum` UNIQUE | Phát hiện & bỏ qua file CSV đã import | Database constraint |
+| `notification_deliveries` UNIQUE `(event_id, channel)` | Tránh gửi trùng email/in-app | Database constraint |
 
-- `workshops.confirmed_count + workshops.held_count <= workshops.capacity`.
-- Unique partial index để một sinh viên chỉ có một registration active cho một workshop (exclude `CANCELLED`, `EXPIRED`).
-- `payments.payment_intent_id` và `payments.idempotency_key` là unique.
-- `checkin_events.event_id` là unique để sync idempotent.
-- Unique constraint logic theo `registration_id + workshop_id` cho check-in accepted để chống check-in nhiều lần.
-- `student_import_batches.checksum` là unique, giúp phát hiện import trùng file.
-- `student_import_rows.row_status` phân biệt: `VALID`, `ERROR`, `DUPLICATE`.
-- `notification_deliveries` unique theo `(event_id, channel)` để tránh gửi trùng kênh.
-- `workshop_documents.upload_status` theo dõi tiến trình xử lý PDF: `UPLOADED`, `PROCESSING`, `DONE`, `FAILED`.
-- `workshops.summary_status` theo dõi AI: `PENDING`, `PROCESSING`, `AI_GENERATED`, `ADMIN_EDITED`, `SUMMARY_FAILED`.
+---
 
-## Thiết kế kiểm soát truy cập
+## 5. Thiết kế kiểm soát truy cập
 
-Hệ thống dùng **RBAC đơn giản** với các role:
+### Mô hình RBAC (Role-Based Access Control)
+Hệ thống phân quyền theo 4 vai trò cố định, enforce **100% tại Backend**.
+| Role | Quyền hạn nghiệp vụ | Endpoint tiêu biểu |
+|---|---|---|
+| `STUDENT` | Xem lịch, đăng ký, thanh toán, xem QR của chính mình | `POST /registrations`, `GET /me/registrations` |
+| `ORGANIZER` | Tạo/sửa/hủy workshop, upload PDF, xem thống kê, quản lý import | `POST /admin/workshops`, `POST /admin/workshops/:id/documents` |
+| `CHECKIN_STAFF` | Preload roster, quét QR, sync check-in | `POST /checkin/preload`, `POST /checkin/sync` |
+| `ADMIN` | Quản lý user/role/cấu hình, có toàn quyền của Organizer | `POST /admin/users/:id/roles` |
 
-| Role | Quyền |
-| --- | --- |
-| `STUDENT` | Xem workshop, đăng ký, thanh toán, xem QR của chính mình |
-| `ORGANIZER` | Tạo/sửa/hủy workshop, upload PDF, xem thống kê, quản lý import |
-| `CHECKIN_STAFF` | Dùng Check-in PWA, preload roster, sync check-in event |
-| `ADMIN` | Quản lý user/role/cấu hình, có toàn quyền organizer |
+### Cơ chế Token & Session
+- **Access Token:** JWT, TTL `15 phút`. Lưu trong memory client. Gửi qua `Authorization: Bearer <token>`.
+- **Refresh Token:** JWT, TTL `7 ngày`. Lưu trong `HTTP-only cookie`. Cơ chế **Rotation**: mỗi lần refresh sẽ phát cặp token mới, đồng thời revoke token cũ bằng cách lưu `jti` vào Redis blocklist (TTL = thời gian còn lại của token cũ).
+- **Bảo mật mật khẩu:** Hash bằng `bcrypt` với `cost factor ≥ 12`. Tuyệt đối không lưu plaintext hoặc MD5/SHA-1.
 
-Backend enforce quyền tại API bằng middleware/guard. Frontend chỉ ẩn/hiện UI, không được xem là lớp bảo mật chính.
+### Điểm kiểm tra quyền (Enforcement Points)
+1. **API Endpoints:** `JwtAuthGuard` → xác thực token → `RolesGuard` → kiểm tra `roles[]` trong payload. Frontend chỉ ẩn UI, **không được coi là ranh giới bảo mật**.
+2. **Payment Webhook:** Không dùng JWT/RBAC. Xác thực bằng **HMAC-SHA256 signature** từ shared secret với gateway.
+3. **Ownership Check:** Ngoài role, backend kiểm tra `student_id == token.user_id` trước khi trả về dữ liệu cá nhân hoặc QR code.
+4. **Audit Logging:** Ghi log tất cả thao tác nhạy cảm: login, role change, workshop create/cancel, token revoke, admin config changes.
 
-Ví dụ endpoint:
+---
 
-- `POST /registrations`: yêu cầu `STUDENT`.
-- `POST /admin/workshops`: yêu cầu `ORGANIZER` hoặc `ADMIN`.
-- `POST /checkin/preload`: yêu cầu `CHECKIN_STAFF` hoặc `ADMIN`.
-- `POST /payment/webhook`: xác thực bằng chữ ký gateway, không dùng user role.
+## 6. Thiết kế các cơ chế bảo vệ hệ thống
 
-## Thiết kế các cơ chế bảo vệ hệ thống
+### 6.1. Kiểm soát tải đột biến (Load Protection)
+**Bài toán:** 12.000 sinh viên truy cập cùng lúc, 60% tập trung trong 3 phút đầu. Backend dễ bị sập nếu xử lý đồng thời toàn bộ request đăng ký.
 
-### Kiểm soát tải đột biến
+**Giải pháp 3 lớp:** `Virtual Queue` → `Token Bucket Rate Limiting` → `DB Transaction + Idempotency`.
 
-Giải pháp: **Virtual Queue + Token Bucket Rate Limiting + Idempotency**.
+#### A. Token Bucket Rate Limiting
+- **Thuật toán chọn:** Token Bucket (cho phép burst nhỏ hợp lệ, phân phối đều, phù hợp hành vi mở trang đồng loạt).
+- **Triển khai:** Redis lưu `(tokens, last_refill_ts)`. Mỗi request kiểm tra nguyên tử bằng Lua Script. Nếu `tokens > 0` → giảm 1, cho qua. Nếu `0` → trả `429 Too Many Requests` + header `Retry-After`.
+- **Cấu hình theo Tier:**
+| Endpoint | Key | Burst | Refill Rate | Hành vi vượt ngưỡng |
+|---|---|---|---|---|
+| Xem lịch (public) | `ip` | 60 | 10/s | `429` + `Retry-After: 5s` |
+| Đăng nhập | `ip` | 10 | 1/s | `429` + `Retry-After: 10s` |
+| **Đăng ký workshop** | `user_id + workshop_id` | 5 | 1/30s | `429` + `Retry-After: 30s` |
+| Admin thao tác | `user_id` | 30 | 5/s | `429` + `Retry-After: 5s` |
 
-#### Lựa chọn thuật toán: Token Bucket
+#### B. Virtual Queue
+- **Cơ chế:** Trước khi gọi `POST /registrations`, client phải xin token qua `POST /workshops/:id/queue-token`.
+- **Redis lưu:** `qt:{user_id}:{workshop_id}` với payload `{issued_at, expires_at}`. TTL = `120 giây`.
+- **Luồng:** Backend chỉ chấp nhận registration request nếu token tồn tại, đúng user/workshop. Ngay sau khi dùng thành công, token bị `DEL` khỏi Redis (one-time-use). Nếu hết hạn, client phải xin lại (quay hàng đợi).
+- **Lợi ích:** Biến bài toán "chống DDOS tự nhiên" thành bài toán "luồng có kiểm soát", bảo vệ DB khỏi bị flood transaction cùng lúc.
 
-So sánh các thuật toán phổ biến:
+#### C. Idempotency Key
+- Client sinh UUID v4 khi bấm "Đăng ký", gửi qua header `Idempotency-Key`.
+- Backend kiểm tra DB: nếu key đã tồn tại trong 24h → trả kết quả cũ, không tạo registration mới.
+- Ngăn chặn hiệu ứng "double-click" hoặc network timeout retry gây oversell.
 
-| Thuật toán | Cho phép burst? | Phân phối đều? | Phù hợp bài toán? |
-| --- | --- | --- | --- |
-| Fixed Window | Có (biên cửa sổ) | Không | ❌ Dễ bị tấn công biên cửa sổ |
-| Sliding Window | Không | Có | ✅ Tốt nhưng tốn bộ nhớ Redis hơn |
-| Token Bucket | Có (burst giới hạn) | Có | ✅ **Được chọn** — cân bằng tốt |
-| Leaky Bucket | Không | Rất đều | ❌ Quá nghiêm ngặt với burst hợp lệ |
+### 6.2. Xử lý cổng thanh toán không ổn định
+**Bài toán:** Payment gateway có thể timeout, giới hạn kết nối, hoặc down hoàn toàn. Nếu không cô lập, lỗi sẽ kéo sập toàn bộ API.
 
-Token Bucket được chọn vì cho phép burst nhỏ khi sinh viên mở trang đồng loạt nhưng vẫn giới hạn tốc độ trung bình. Redis lưu `(tokens, last_refill_ts)` theo key — mỗi giây nạp lại `refill_rate` token, mỗi request tiêu 1 token.
+**Giải pháp:** `Circuit Breaker Pattern` + `Async Webhook` + `Graceful Degradation`.
 
-#### Ngưỡng cấu hình theo endpoint tier
+#### A. Circuit Breaker State Machine
+Lưu trạng thái tại Redis key `cb:payment_gateway`.
+| Trạng thái | Mô tả | Điều kiện chuyển |
+|---|---|---|
+| **Closed** | Hoạt động bình thường | → **Open** khi: ≥ 5 lỗi liên tiếp trong 30s HOẶC tỉ lệ lỗi > 50% trong cửa sổ 30s (min 10 req) |
+| **Open** | Từ chối ngay mọi request mới, trả `503` | → **Half-Open** sau 30s timeout |
+| **Half-Open** | Cho qua tối đa 3 request thăm dò (probe) | → **Closed** nếu 3 probe đều thành công. → **Open** nếu bất kỳ probe nào lỗi |
 
-| Endpoint tier | Key | Capacity (burst) | Refill rate | Hành vi vượt ngưỡng |
-| --- | --- | --- | --- | --- |
-| Công khai (xem lịch) | `ip` | 60 token | 10 token/s | `429` + `Retry-After: 5s` |
-| Đăng nhập | `ip` | 10 token | 1 token/s | `429` + `Retry-After: 10s` |
-| Đăng ký workshop | `user_id + workshop_id` | 5 token | 1 token/30s | `429` + `Retry-After: 30s` |
-| Admin thao tác | `user_id` | 30 token | 5 token/s | `429` + `Retry-After: 5s` |
-| Webhook payment | IP gateway whitelist | Không giới hạn | — | Chỉ kiểm tra chữ ký |
+#### B. Graceful Degradation khi Circuit Open
+| Chức năng | Trạng thái hoạt động | Lý do |
+|---|---|---|
+| Xem lịch / Chi tiết workshop | ✅ Bình thường | Không phụ thuộc gateway |
+| Đăng ký workshop miễn phí | ✅ Bình thường | Không gọi gateway |
+| Đăng ký workshop có phí | ⚠️ `503 Service Unavailable` | Ngăn user bị treo ở trang thanh toán ảo |
+| Webhook inbound từ gateway | ✅ Vẫn xử lý | Webhook là đường vào độc lập, không đi qua CB |
 
-#### Virtual Queue
+#### C. Xử lý Timeout & Client Disconnect
+- API gọi gateway với timeout cứng `5 giây`. Vượt quá → tính là lỗi, tăng counter CB.
+- Nếu client browser timeout nhưng gateway đã trừ tiền thành công → **Webhook vẫn gửi về backend**. Backend xác thực chữ ký → cập nhật `payment SUCCEEDED` → chuyển registration `CONFIRMED`. User không cần thanh toán lại.
 
-Virtual queue phát token theo nhịp kiểm soát để chỉ một lượng request hợp lệ đi vào registration API mỗi giây. Token gắn với `user_id`, `workshop_id`, `issued_at`, `expires_at = issued_at + 120s`. Token chỉ dùng được 1 lần — sau khi dùng hoặc hết hạn bị xóa khỏi Redis.
+### 6.3. Chống trừ tiền hai lần (Idempotent Payment)
+**Bài toán:** Network retry, user bấm nhiều lần, hoặc webhook gửi trùng từ gateway.
 
-Khi vượt ngưỡng bất kỳ tier nào, API trả `429 Too Many Requests` kèm header `Retry-After`.
+**Giải pháp:** `Idempotency Key` ở 3 tầng.
+1. **Registration Intent:** `payments.idempotency_key` là UNIQUE constraint. Retry cùng key trả về `payment_intent_id` cũ.
+2. **Payment Intent ID:** `payments.payment_intent_id` UNIQUE. Webhook handler check `payment_intent_id` trước khi update. Nếu đã `SUCCEEDED` → trả `200 OK` ngay, không cập nhật seat count.
+3. **Hold Slot Expiration:** Worker chạy định kỳ (hoặc delayed job 10 phút). Nếu `hold_expires_at` hết mà payment chưa `SUCCEEDED` → chuyển registration `EXPIRED`, giảm `held_count`, slot được trả lại.
+4. **Auto-Refund (Edge Case):** Nếu webhook `SUCCEEDED` đến SAU khi registration đã `EXPIRED` → hệ thống tự động gọi `PaymentAdapter.refund()` với idempotency key riêng, chuyển registration sang `NEEDS_REVIEW` để admin xử lý.
 
-### Xử lý cổng thanh toán không ổn định
+---
 
-Giải pháp: **Payment Adapter + Circuit Breaker + Graceful Degradation**.
+## 7. Các quyết định kỹ thuật quan trọng (ADR)
 
-#### Các trạng thái Circuit Breaker
+| Mã | Quyết định | Lý do chọn | Trade-off / Rủi ro | Giải pháp giảm thiểu |
+|---|---|---|---|---|
+| **ADR-01** | **Modular Monolith** thay vì Microservices | Nhóm 3 người, đồ án học thuật. Giảm overhead deploy, monitoring, distributed tracing. Boundary rõ ràng qua Domain Events. | Khó scale độc lập từng module khi tải cực lớn. | Thiết kế module decoupled, dùng BullMQ/Redis. Có thể tách Payment/Notification thành service riêng sau này. |
+| **ADR-02** | **PostgreSQL** làm DB chính, **không dùng NoSQL** | Registration/Payment/Check-in cần ACID, row lock, constraint chặt chẽ. Chống oversell bắt buộc phải có transaction atomic. | NoSQL scale ngang tốt hơn nhưng không đảm bảo consistency cho bài toán seat counting. | Dùng connection pooling, read replica (nếu cần), tối ưu index. Giữ dữ liệu tạm ở Redis. |
+| **ADR-03** | **`SELECT FOR UPDATE` + Hold Slot** thay vì Optimistic Locking | Capacity workshop nhỏ (~60-200). Row lock đơn giản, đảm bảo 100% không oversell khi tranh chấp cao. Optimistic lock dễ fail retry gây trải nghiệm tệ. | Tuần tự hóa request trên cùng workshop row, có thể giảm throughput. | Transaction giữ lock cực ngắn (<50ms), không gọi I/O ngoài trong transaction. Hold slot giải phóng chỗ nhanh. |
+| **ADR-04** | **Token Bucket + Virtual Queue** | Token Bucket cho phép burst hợp lệ khi mở đăng ký. Virtual Queue điều tiết luồng request vào DB, biến đồng thời thành tuần tự có kiểm soát. | Cần Redis ổn định. Logic phức tạp hơn Fixed Window. | Dùng Lua script atomic trên Redis. Fallback: nếu Redis down, rate limit vô hiệu nhưng DB transaction vẫn bảo vệ oversell. |
+| **ADR-05** | **Async Payment Intent + Signed Webhook** | Đồng bộ payment dễ timeout, treo request, gây double charge nếu user retry. Webhook là chuẩn công nghiệp, đảm bảo trạng thái cuối cùng chính xác. | Nhiều trạng thái trung gian (`PENDING_PAYMENT`, `INITIATED`). Cần worker reconcile. | Circuit breaker cô lập lỗi. Reconcile worker quét stale payment mỗi 15 phút. Hold slot tự expire. |
+| **ADR-06** | **Check-in PWA Offline-first** thay vì Native App | Triển khai nhanh, cross-platform, không cần App Store review. Service Worker + IndexedDB hỗ trợ offline mạnh. | Phụ thuộc browser storage. Safari iOS có thể xóa cache nếu không cài PWA. | Bắt buộc HTTPS. Yêu cầu staff "Add to Home Screen". Sync idempotent qua `event_id` UUID. |
+| **ADR-07** | **Notification Outbox + Channel Adapter** | Business module không nên gọi trực tiếp email/Telegram. Outbox đảm bảo event không mất nếu worker crash. Adapter dễ mở rộng kênh mới. | Thêm độ trễ nhẹ so với gửi đồng bộ. Cần bảng `notification_events` & `deliveries`. | Worker xử lý async, retry per channel độc lập. Business transaction commit trước khi ghi outbox. |
+| **ADR-08** | **SSE + Redis Pub/Sub** thay vì Supabase Realtime/WebSocket | Supabase Realtime bypass backend API (vi phạm boundary), free tier giới hạn 200 connection. SSE một chiều, nhẹ, phù hợp seat update. | SSE không hỗ trợ client→server message. Cần duy trì nhiều connection dài. | Chỉ dùng cho seat count. Client reconnect tự động. Redis Pub/Sub phân tán update qua nhiều API instance. |
+| **ADR-09** | **CSV Staging Table + Atomic Promotion** | Import trực tiếp vào bảng `students` dễ gây corrupt data nếu file lỗi hoặc worker crash giữa chừng. | Cần thêm bảng `student_import_rows` và `batches`. Tốn dung lượng lưu log. | Promotion trong 1 transaction. Nếu fail → rollback toàn bộ. Checksum chống import trùng file. |
+| **ADR-10** | **JWT Stateless + Refresh Rotation + Redis Blocklist** | JWT stateless scale ngang dễ dàng. Không cần session store chung. Rotation giảm rủi ro token bị đánh cắp. | JWT không thể revoke trước hạn nếu không có blocklist. | Lưu `jti` token cũ vào Redis với TTL = thời gian còn lại. Access TTL ngắn (15m) giảm cửa sổ tấn công. |
 
-| Trạng thái | Mô tả | Điều kiện chuyển tiếp |
-| --- | --- | --- |
-| **Closed** | Hoạt động bình thường, gọi gateway như thường | Chuyển sang **Open** khi ≥ 5 lỗi liên tiếp trong cửa sổ 30 giây |
-| **Open** | Từ chối toàn bộ request thanh toán mới tức thì | Chuyển sang **Half-Open** sau 30 giây không thử |
-| **Half-Open** | Cho qua tối đa 3 request thử nghiệm | Chuyển về **Closed** nếu cả 3 thành công; về **Open** nếu bất kỳ 1 thất bại |
-
-#### Cấu hình ngưỡng
-
-- **Failure threshold:** 5 lỗi liên tiếp (hoặc tỉ lệ lỗi > 50% trong 30s với ít nhất 10 request).
-- **Timeout lỗi:** call gateway timeout sau 5 giây — tính là 1 lỗi.
-- **Open duration:** 30 giây trước khi thử Half-Open.
-- **Half-Open probe count:** 3 request — nếu cả 3 thành công mới reset về Closed.
-- **State lưu tại:** Redis key `circuit_breaker:payment_gateway` với TTL tự động.
-
-#### Graceful Degradation
-
-Khi circuit **Open**, hệ thống phản ứng theo từng chức năng:
-
-| Chức năng | Hành vi khi circuit Open |
-| --- | --- |
-| Xem lịch / danh sách workshop | ✅ Hoạt động bình thường |
-| Đăng ký workshop miễn phí | ✅ Hoạt động bình thường |
-| Đăng ký workshop có phí | ⚠️ Trả HTTP 503 kèm thông báo "Thanh toán tạm gián đoạn" |
-| Admin quản lý workshop | ✅ Hoạt động bình thường |
-| Webhook payment đến | ✅ Vẫn xử lý (inbound, không cần gọi gateway) |
-
-### Chống trừ tiền hai lần
-
-Giải pháp: **Idempotency Key** ở registration và payment.
-
-Frontend sinh `Idempotency-Key` (UUID v4) ngay khi sinh viên bấm "Đăng ký" và gửi kèm request. Backend lưu key cùng registration. Nếu client retry với cùng key, backend trả lại registration/payment đã tạo trước đó mà không xử lý lại.
-
-Payment Module lưu `payments.idempotency_key` và `payment_intent_id` unique. Webhook handler cũng idempotent theo event ID/payment intent ID.
-
-#### Thời hạn lưu trữ (TTL)
-
-| Loại key | Nơi lưu | TTL | Lý do |
-| --- | --- | --- | --- |
-| Registration idempotency key | `registrations.idempotency_key` (DB) | 24 giờ | Đủ để client retry trong phiên đăng ký; sau đó sinh viên có thể đăng ký lại |
-| Payment idempotency key | `payments.idempotency_key` (DB) | 30 ngày | Phục vụ reconcile và khiếu nại thanh toán |
-| Webhook event ID | `payments.payment_intent_id` (DB) | Vĩnh viễn (unique constraint) | Webhook có thể đến nhiều ngày sau; không được xóa |
-| Queue token | Redis (TTL key) | 120 giây | Sau khi dùng hoặc hết hạn, xóa khỏi Redis ngay |
-
-TTL được thực thi bằng:
-- **DB:** Không có TTL nạo do là unique constraint vĩnh viễn; nếu cần làm sạch — job archive dữ liệu cũ theo lịch.
-- **Redis:** `EXPIRE` hoặc `SET ... EX` khi ghi key queue token.
-
-## Các quyết định kỹ thuật quan trọng (ADR)
-
-### ADR-001: Modular Monolith thay vì Microservices
-
-Chọn modular monolith vì hệ thống có nhiều nghiệp vụ nhưng đội phát triển nhỏ, cần giảm độ phức tạp vận hành. Tradeoff là khó scale từng module độc lập hơn microservices, nhưng boundary module vẫn cho phép tách sau này.
-
-### ADR-002: PostgreSQL là database chính
-
-Chọn PostgreSQL vì registration/payment/check-in cần transaction, unique constraint và row-level lock. Redis chỉ dùng cho dữ liệu tạm và pub/sub.
-
-### ADR-003: DB Row Lock + Hold Slot cho đăng ký
-
-Chọn row lock để đảm bảo không oversell. Hold slot hỗ trợ workshop có phí và payment timeout. Tradeoff là workshop hot sẽ tuần tự hóa trên row lock, nhưng capacity nhỏ và transaction ngắn nên chấp nhận được.
-
-### ADR-004: Virtual Queue + Rate Limit
-
-Chọn virtual queue để bảo vệ API và tăng công bằng khi nhiều sinh viên vào cùng lúc. Rate limit chặn spam từ client/script.
-
-### ADR-005: Async Payment Intent + Webhook
-
-Chọn async payment để tránh request treo và xử lý chính xác trường hợp client timeout nhưng tiền đã bị trừ. Tradeoff là nhiều trạng thái hơn.
-
-### ADR-006: Check-in PWA offline-first
-
-Chọn PWA thay cho native mobile app để staff dễ truy cập và triển khai nhanh. Tradeoff là phụ thuộc browser/storage, nên cần preload, install PWA và IndexedDB event log.
-
-### ADR-007: Notification Channel Adapter
-
-Chọn Notification Module với adapter để thêm Telegram hoặc kênh mới mà không sửa Registration Module.
-
-### ADR-008: Async AI Summary auto-publish
-
-Chọn xử lý PDF/AI bằng worker, auto-publish summary với trạng thái `AI_GENERATED`. Admin có thể sửa sau thành `ADMIN_EDITED`.
-
-### ADR-009: CSV Staging + Batch Audit
-
-Chọn staging table và atomic promotion để file lỗi không làm hỏng bảng `students`. Batch audit giúp truy vết nguồn dữ liệu.
-
-### ADR-010: SSE/WebSocket realtime seat updates
-
-Chọn SSE/WebSocket để sinh viên thấy số chỗ gần thời gian thực. Tradeoff là vận hành nhiều kết nối phức tạp hơn polling.
-
+---
+*Tài liệu này được thiết kế để làm rõ ranh giới kiến trúc, cơ chế chịu lỗi phi chức năng và các ràng buộc kỹ thuật then chốt. Mọi luồng nghiệp vụ chi tiết, kịch bản lỗi và tiêu chí chấp nhận được đặc tả đầy đủ trong thư mục `specs/`.*

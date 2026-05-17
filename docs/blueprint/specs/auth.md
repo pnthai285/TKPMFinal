@@ -1,70 +1,131 @@
-# Đặc tả: Auth và RBAC
+# Delta for Auth & RBAC
 
-## Mô tả
+## Mô tả tính năng
+Tính năng Auth & RBAC quản lý xác thực người dùng, quản lý phiên làm việc và phân quyền truy cập cho 4 nhóm vai trò: `STUDENT`, `ORGANIZER`, `CHECKIN_STAFF`, `ADMIN`. Hệ thống sử dụng cơ chế **JWT không trạng thái (stateless)** kết hợp **Refresh Token Rotation** và **Redis Blocklist** để đảm bảo khả năng mở rộng ngang, bảo mật cao và khả năng thu hồi token khi cần. Mọi kiểm tra quyền được thực thi **100% tại Backend**, giao diện frontend chỉ mang tính hỗ trợ UX và không được coi là ranh giới bảo mật.
 
-Tính năng Auth/RBAC quản lý đăng nhập, phiên làm việc và phân quyền cho bốn nhóm: sinh viên, ban tổ chức, nhân sự check-in và admin. Hệ thống dùng RBAC đơn giản, mỗi user có một hoặc nhiều role.
+---
 
-## Cơ chế token: JWT
+## ADDED Requirements
 
-Hệ thống chọn **JWT (JSON Web Token)** thay cho server-side session vì:
-- Backend là Modular Monolith có thể scale nhiều instance — JWT stateless, không cần session store chung.
-- Check-in PWA cần gắn token vào request offline-friendly.
-- Tradeoff: không thể thu hồi token trước hạn nếu không dùng blocklist; giải quyết bằng access token TTL ngắn.
+### Requirement: Xác thực không trạng thái dựa trên JWT
+Hệ thống PHẢI sử dụng JWT (JSON Web Token) cho xác thực không trạng thái, kết hợp access token thời gian sống ngắn và refresh token có thể xoay vòng.
 
-### Cấu trúc token
+#### Scenario: Người dùng đăng nhập với thông tin hợp lệ
+- GIVEN một người dùng có `status = ACTIVE`
+- WHEN người dùng gửi email và mật khẩu hợp lệ đến `POST /auth/login`
+- THEN backend xác thực mật khẩu bằng bcrypt hash
+- AND cấp access token (JWT, TTL 15 phút) chứa `user_id`, `roles[]`, `iat`, `exp`
+- AND cấp refresh token (JWT, TTL 7 ngày) chứa `user_id`, `jti`, `exp`
+- AND access token được lưu trong bộ nhớ client (memory)
+- AND refresh token được lưu trong cookie `HTTP-only`, `Secure`, `SameSite=Strict`
 
-| Loại | Lưu tại | TTL | Payload |
-| --- | --- | --- | --- |
-| **Access Token** | Memory (client) / `Authorization: Bearer` header | 15 phút | `user_id`, `roles[]`, `iat`, `exp` |
-| **Refresh Token** | HTTP-only cookie / secure storage | 7 ngày | `user_id`, `jti` (JWT ID unique), `exp` |
+#### Scenario: Người dùng đăng nhập sai thông tin
+- GIVEN bất kỳ người dùng nào
+- WHEN người dùng gửi email hoặc mật khẩu không chính xác
+- THEN backend trả về `401 Unauthorized` với message chung để tránh tiết lộ thông tin tồn tại tài khoản
 
-### Luồng refresh token
+#### Scenario: Tài khoản bị khóa cố đăng nhập
+- GIVEN một người dùng có `status = LOCKED`
+- WHEN người dùng gửi thông tin đăng nhập hợp lệ
+- THEN backend trả về `403 Forbidden` với message "Tài khoản đã bị khóa"
 
-1. Access token hết hạn — client nhận `401`.
-2. Client gửi refresh token lên `POST /auth/refresh`.
-3. Backend kiểm tra refresh token còn hạn và chưa bị revoke (`jti` không có trong Redis blocklist).
-4. Backend phát access token mới (15 phút) và refresh token mới (rotate, 7 ngày).
-5. Refresh token cũ bị revoke bằng cách lưu `jti` vào Redis với TTL = thời gian còn lại.
+---
 
-### Bảo mật mật khẩu
+### Requirement: Làm mới và xoay vòng Token (Token Rotation)
+Hệ thống PHẢI hỗ trợ tự động làm mới access token thông qua refresh token, bắt buộc xoay vòng (rotation) mỗi lần sử dụng.
 
-- Mật khẩu hash bằng **bcrypt** với cost factor ≥ 12.
-- Không lưu plaintext hay MD5/SHA-1.
+#### Scenario: Access token hết hạn, refresh token còn hợp lệ
+- GIVEN một người dùng đã xác thực có access token hết hạn
+- WHEN client gửi refresh token đến `POST /auth/refresh`
+- THEN backend kiểm tra refresh token còn hạn và `jti` không nằm trong Redis blocklist
+- AND cấp cặp token mới: access token (15 phút) + refresh token (7 ngày)
+- AND thu hồi refresh token cũ bằng cách lưu `jti` vào Redis với TTL = thời gian còn lại của token cũ
 
-## Luồng chính
+#### Scenario: Refresh token hết hạn hoặc đã bị thu hồi
+- GIVEN một refresh token đã hết hạn hoặc `jti` của nó đã nằm trong Redis blocklist
+- WHEN client gửi token này đến `POST /auth/refresh`
+- THEN backend trả về `401 Unauthorized`
+- AND client bắt buộc chuyển hướng người dùng đến trang đăng nhập lại
 
-1. User đăng nhập bằng email/mật khẩu.
-2. Backend kiểm tra `users.status` (active/locked) và xác thực bcrypt hash.
-3. Backend tạo access token (JWT, 15 phút) và refresh token (JWT, 7 ngày).
-4. Frontend lưu access token trong memory; refresh token trong HTTP-only cookie.
-5. Mỗi request API gắn `Authorization: Bearer <access_token>`.
-6. Backend guard decode token, kiểm tra `exp` và `roles[]`, enforce quyền.
-7. Frontend tự động refresh khi nhận `401`; nếu refresh token cũng hết hạn — redirect đăng nhập lại.
+#### Scenario: Tấn công Replay bằng refresh token đã dùng
+- GIVEN một refresh token đã được xoay vòng thành công
+- WHEN token cũ bị đánh cắp và gửi lại đến `POST /auth/refresh`
+- THEN backend phát hiện `jti` đã nằm trong Redis blocklist
+- AND trả về `401 Unauthorized`, đồng thời có thể kích hoạt cảnh báo bảo mật (tuỳ chính sách)
 
-## Kịch bản lỗi
+---
 
-- Sai thông tin đăng nhập: trả `401 Unauthorized`.
-- Tài khoản bị khóa (`status = LOCKED`): trả `403 Forbidden`.
-- Không có role phù hợp: trả `403 Forbidden`.
-- Access token hết hạn (15 phút): client dùng refresh token lấy token mới.
-- Refresh token hết hạn (7 ngày) hoặc đã revoke: trả `401`, yêu cầu đăng nhập lại.
-- User cố truy cập dữ liệu của người khác: backend kiểm tra ownership (`student_id` hoặc `user_id`) và từ chối.
+### Requirement: Kiểm soát truy cập dựa trên vai trò (RBAC)
+Hệ thống PHẢI thực thi RBAC tại Backend thông qua Guard middleware. Việc ẩn/hiện giao diện ở frontend KHÔNG được dùng để thay thế kiểm tra quyền.
 
-## Ràng buộc
+#### Scenario: Sinh viên cố truy cập API quản trị workshop
+- GIVEN một người dùng đã xác thực có role `STUDENT`
+- WHEN người dùng gọi API chỉ dành cho `ORGANIZER` hoặc `ADMIN` (ví dụ: `POST /admin/workshops`)
+- THEN `RolesGuard` từ chối request
+- AND backend trả về `403 Forbidden`
 
-- Không tin vào việc ẩn/hiện UI ở frontend; backend là nơi enforce duy nhất.
-- API admin chỉ cho `ORGANIZER` hoặc `ADMIN`.
-- API check-in chỉ cho `CHECKIN_STAFF` hoặc `ADMIN`.
-- Webhook payment không dùng user role mà xác thực bằng chữ ký HMAC của gateway.
-- Refresh token phải rotate mỗi lần dùng (old token revoke, new token phát).
-- Các thao tác quan trọng ghi audit log gồm: đăng nhập, đổi role, tạo/hủy workshop, revoke token.
+#### Scenario: Nhân sự check-in cố truy cập API admin
+- GIVEN một người dùng đã xác thực có role `CHECKIN_STAFF`
+- WHEN người dùng gọi API admin workshop
+- THEN backend trả về `403 Forbidden`
 
-## Tiêu chí chấp nhận
+#### Scenario: Organizer cố xem dữ liệu riêng tư của sinh viên khác
+- GIVEN một người dùng đã xác thực có role `ORGANIZER`
+- WHEN người dùng cố gắng gọi endpoint QR cá nhân của sinh viên khác (`GET /me/registrations/:id/qr`)
+- THEN backend kiểm tra quyền sở hữu (`student_id` hoặc `user_id` khớp với token)
+- AND trả về `403 Forbidden` do vi phạm nguyên tắc ownership
 
-- Sinh viên không thể gọi API tạo/sửa workshop.
-- Check-in staff không thể gọi API admin workshop.
-- Organizer không thể xem QR riêng tư của sinh viên qua endpoint cá nhân.
-- Admin có thể gán role cho user.
-- Mọi request không đủ quyền đều bị backend từ chối với `401` hoặc `403`.
-- Refresh token đã dùng không thể dùng lại.
-- Access token hết hạn sau đúng 15 phút.
+#### Scenario: Admin gán vai trò cho người dùng
+- GIVEN một người dùng đã xác thực có role `ADMIN`
+- WHEN admin gán vai trò mới cho người dùng đích qua `POST /admin/users/:id/roles`
+- THEN vai trò được lưu vào database
+- AND hệ thống ghi nhận một bản ghi audit log chứa hành động, người thực hiện và timestamp
+
+---
+
+### Requirement: Bảo mật mật khẩu và Hashing
+Hệ thống PHẢI mã hóa mật khẩu bằng bcrypt với cost factor ≥ 12. Tuyệt đối không lưu plaintext, MD5 hoặc SHA-1.
+
+#### Scenario: Lưu trữ mật khẩu khi đăng ký hoặc đổi mật khẩu
+- GIVEN một người dùng mới hoặc người dùng yêu cầu đổi mật khẩu
+- WHEN người dùng gửi mật khẩu gốc
+- THEN backend hash mật khẩu bằng bcrypt (cost factor ≥ 12) trước khi lưu vào `users.password_hash`
+
+---
+
+### Requirement: Xác thực Webhook độc lập
+Hệ thống PHẢI xác thực webhook từ cổng thanh toán bằng chữ ký HMAC, không phụ thuộc vào hệ thống RBAC của người dùng.
+
+#### Scenario: Cổng thanh toán gửi webhook xác nhận
+- GIVEN cổng thanh toán được cấu hình shared HMAC secret
+- WHEN cổng thanh toán gửi webhook có chữ ký đến `POST /payments/webhook`
+- THEN `WebhookSignatureGuard` xác thực HMAC-SHA256
+- AND chỉ xử lý payload nếu chữ ký hợp lệ, bỏ qua việc kiểm tra `Authorization` header
+
+---
+
+### Requirement: Ghi nhật ký kiểm toán (Audit Logging)
+Hệ thống PHẢI ghi lại audit log cho tất cả các hành động nhạy cảm liên quan đến bảo mật và quản trị.
+
+#### Scenario: Ghi log hành động bảo mật/quản trị
+- GIVEN bất kỳ hành động nào sau đây xảy ra: đăng nhập, thay đổi vai trò, tạo/hủy workshop, thu hồi token
+- THEN hệ thống ghi bản ghi audit log bao gồm: `actor_user_id`, `action_type`, `target_resource`, `timestamp`, và `ip_address`
+- AND log được lưu vào bảng riêng hoặc hệ thống tập trung để truy vết và điều tra sự cố
+
+---
+
+## Technical Constraints
+
+| Tham số | Giá trị | Lý do / Ghi chú triển khai |
+| --- | --- | --- |
+| **Access Token TTL** | 15 phút | Thời gian sống ngắn giảm thiểu rủi ro nếu token bị lộ qua XSS |
+| **Refresh Token TTL** | 7 ngày | Cân bằng giữa bảo mật và trải nghiệm người dùng (ít phải đăng nhập lại) |
+| **Lưu trữ Access Token** | Client memory | Không lưu trong `localStorage`/`sessionStorage` để tránh bị đánh cắp bởi script |
+| **Lưu trữ Refresh Token** | `HTTP-only` + `Secure` cookie | Ngăn JavaScript truy cập, bảo vệ khỏi XSS; yêu cầu HTTPS |
+| **Hashing mật khẩu** | bcrypt, cost factor ≥ 12 | Chuẩn công nghiệp, kháng brute-force, phù hợp CPU hiện đại |
+| **Cơ chế xoay vòng** | Bắt buộc mỗi lần refresh | Chống replay attack; token cũ bị revoke ngay lập tức |
+| **Thu hồi token** | Redis blocklist `jti:{jti}` | JWT vốn stateless, dùng Redis lưu `jti` với TTL = thời gian còn lại của token để revoke hiệu quả |
+| **Điểm thực thi quyền** | Backend Guards (`JwtAuthGuard` → `RolesGuard`) | Frontend chỉ ẩn UI; mọi endpoint đều phải được bảo vệ ở server |
+| **Xác thực Webhook** | HMAC-SHA256 signature | Tách biệt hoàn toàn khỏi luồng user auth; chống giả mạo webhook từ bên ngoài |
+| **Phạm vi Audit Log** | Login, role change, workshop CRUD, token revoke | Đảm bảo khả năng truy vết (traceability) cho admin và kiểm toán hệ thống |
+| **Kiểm tra Ownership** | Backend validate `user_id` / `student_id` trong token | Ngăn người dùng A thao tác trên dữ liệu của người dùng B dù cùng role |
